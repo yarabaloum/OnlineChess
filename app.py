@@ -1,35 +1,82 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 import os
 import uuid
 import cv2
 import numpy as np
 import base64
-import tensorflow as tf
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from pathlib import Path
 
-app = Flask(__name__)
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import load_model
+    from tensorflow.keras.preprocessing.image import ImageDataGenerator
+except Exception:
+    tf = None
+    load_model = None
+    ImageDataGenerator = None
+
+
+app = Flask(__name__, static_folder='static', static_url_path='/static')
+
 UPLOAD_FOLDER = 'uploads'
 OUTPUT_FOLDER = 'outputs'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# Load model
-model = load_model("model_32.h5")
-image_gen = ImageDataGenerator(preprocessing_function=tf.keras.applications.mobilenet_v2.preprocess_input)
-ch = ['h', 'g', 'f', 'e', 'd', 'c', 'b', 'a']
-clas = ['B_Bishop', 'B_King', 'B_Knight', 'B_Pawn', 'B_Queen', 'B_Rook',
-        'Empty', 'W_Bishop', 'W_King', 'W_Knight', 'W_Pawn', 'W_Queen', 'W_Rook']
 
-def predict_image(img_array):
+
+MODEL_PATH = Path(os.getenv("MODEL_PATH", "model_32.h5"))
+model = None
+image_gen = None
+
+if load_model is not None and MODEL_PATH.exists():
+    try:
+        model = load_model(str(MODEL_PATH))
+        image_gen = ImageDataGenerator(
+            preprocessing_function=tf.keras.applications.mobilenet_v2.preprocess_input
+        )
+        print(f"[OK] Loaded model: {MODEL_PATH}")
+    except Exception as e:
+        print(f"[WARN] Failed to load model at {MODEL_PATH}: {e}\nRunning in DEMO mode (no ML).")
+else:
+    print("[WARN] model_32.h5 not found or TensorFlow not available. Running in DEMO mode (no ML).")
+
+
+
+ch = ['h', 'g', 'f', 'e', 'd', 'c', 'b', 'a']
+
+
+clas = [
+    'B_Bishop', 'B_King', 'B_Knight', 'B_Pawn', 'B_Queen', 'B_Rook',
+    'Empty', 'W_Bishop', 'W_King', 'W_Knight', 'W_Pawn', 'W_Queen', 'W_Rook'
+]
+
+
+
+def predict_image(img_array: np.ndarray) -> str:
+    """
+    Predict the class of a single square (32x32) image.
+    If model is missing -> returns 'Empty' (demo behavior).
+    """
+    if model is None or image_gen is None:
+        return 'Empty'
+
+    if img_array.shape[-1] == 3:
+        img_array = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+
     img_array = cv2.resize(img_array, (32, 32))
+
     img_array = np.expand_dims(img_array, axis=0)
     img_array = image_gen.preprocessing_function(img_array)
+
+   
     predictions = model.predict(img_array, verbose=0)
-    predicted_class = np.argmax(predictions, axis=1)[0]
+    predicted_class = int(np.argmax(predictions, axis=1)[0])
     return clas[predicted_class]
 
-def get_chessboard_state(image, rows, cols, square_width, square_height):
+
+def get_chessboard_state(image: np.ndarray, rows: int, cols: int,
+                         square_width: int, square_height: int) -> dict:
     chessboard_state = {}
     for i in range(rows):
         for j in range(cols):
@@ -41,7 +88,8 @@ def get_chessboard_state(image, rows, cols, square_width, square_height):
             chessboard_state[square_name] = piece
     return chessboard_state
 
-def detect_moves(state_1, state_2):
+
+def detect_moves(state_1: dict, state_2: dict):
     from_squares = []
     to_squares = []
     capture = False
@@ -70,6 +118,7 @@ def detect_moves(state_1, state_2):
         moves.append((from_square, to_square, move_text))
 
     elif len(from_squares) == 2 and len(to_squares) == 2:
+        # crude castling detection
         for square, piece in from_squares:
             if "King" in piece:
                 king_from = square
@@ -81,18 +130,24 @@ def detect_moves(state_1, state_2):
                         break
     return moves
 
-def process_video_with_movement_and_labels(video_path, output_path):
+
+def process_video_with_movement_and_labels(video_path: str, output_path: str):
     cap = cv2.VideoCapture(video_path)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open input video: {video_path}")
+
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps    = cap.get(cv2.CAP_PROP_FPS) or 25.0
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    if not out.isOpened():
+        raise RuntimeError(f"Failed to open output writer: {output_path}")
 
     rows, cols = 8, 8
     square_height = height // rows
-    square_width = width // cols
+    square_width  = width // cols
 
     prev_state = None
     move_list = []
@@ -106,6 +161,7 @@ def process_video_with_movement_and_labels(video_path, output_path):
         if not ret:
             break
 
+     
         if frame_count % 10 == 0:
             current_state = get_chessboard_state(frame, rows, cols, square_width, square_height)
             if prev_state is not None:
@@ -118,14 +174,13 @@ def process_video_with_movement_and_labels(video_path, output_path):
                         print("Detected move:", move_text)
             prev_state = current_state
 
-        # Draw labels on every square (grid + class name)
+        
         for i in range(rows):
             for j in range(cols):
                 x_start, y_start = j * square_width, i * square_height
                 x_end, y_end = x_start + square_width, y_start + square_height
                 square = frame[y_start:y_end, x_start:x_end]
-                square_rgb = cv2.cvtColor(square, cv2.COLOR_BGR2RGB)
-                label = predict_image(square_rgb)
+                label = predict_image(square)
 
                 cv2.rectangle(frame, (x_start, y_start), (x_end, y_end), (255, 0, 0), 1)
                 cv2.putText(frame, label, (x_start + 3, y_start + 20),
@@ -143,16 +198,42 @@ def process_video_with_movement_and_labels(video_path, output_path):
     out.release()
     return move_list
 
+
+@app.route('/')
+def home():
+    """Serve the frontend page."""
+    return send_from_directory(app.static_folder, 'index.html')
+
+@app.route('/favicon.ico')
+def favicon():
+    """Silence the favicon 404 (or place a favicon.ico in /static)."""
+    return ('', 204)
+
 @app.route('/upload', methods=['POST'])
 def upload_video():
+    """
+    Accepts a file field named 'video' (MP4), processes it, and returns:
+      {
+        "video": "<base64 of processed mp4>",
+        "moves": ["...","..."],
+        "filename": "output_<uuid>.mp4"
+      }
+    """
+    if 'video' not in request.files or request.files['video'].filename == '':
+        return jsonify({"error": "No video provided"}), 400
+
     video_file = request.files['video']
-    filename = str(uuid.uuid4()) + ".mp4"
+    filename = f"{uuid.uuid4()}.mp4"
     input_path = os.path.join(UPLOAD_FOLDER, filename)
     output_path = os.path.join(OUTPUT_FOLDER, "output_" + filename)
 
     video_file.save(input_path)
     print("Processing:", input_path)
-    move_list = process_video_with_movement_and_labels(input_path, output_path)
+
+    try:
+        move_list = process_video_with_movement_and_labels(input_path, output_path)
+    except Exception as e:
+        return jsonify({"error": f"Processing failed: {e}"}), 500
 
     with open(output_path, 'rb') as f:
         encoded_video = base64.b64encode(f.read()).decode('utf-8')
@@ -160,32 +241,11 @@ def upload_video():
     return jsonify({
         "video": encoded_video,
         "moves": move_list,
-        "filename": os.path.basename(output_path)
+        "filename": os.path.basename(output_path),
+        "mode": "ml" if model is not None else "demo"
     })
 
+
 if __name__ == '__main__':
-    app.run(debug=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    
+   
+    app.run(host='127.0.0.1', port=5000, debug=True)
